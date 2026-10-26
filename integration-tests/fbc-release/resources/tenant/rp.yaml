@@ -9,7 +9,8 @@ metadata:
     originating-tool: "${originating_tool}"
   name: ${release_plan_happy_name}
 spec:
-  application: ${application_name}
+  releaseGracePeriodDays: 1
+  application: ${happy_application_name}
   target: ${managed_namespace}
 ---
 apiVersion: appstudio.redhat.com/v1alpha1
@@ -22,6 +23,7 @@ metadata:
     originating-tool: "${originating_tool}"
   name: ${release_plan_hotfix_name}
 spec:
+  releaseGracePeriodDays: 1
   application: ${application_name}
   target: ${managed_namespace}
 ---
@@ -35,6 +37,7 @@ metadata:
     originating-tool: "${originating_tool}"
   name: ${release_plan_prega_name}
 spec:
+  releaseGracePeriodDays: 1
   application: ${application_name}
   target: ${managed_namespace}
 ---
@@ -48,6 +51,7 @@ metadata:
     originating-tool: "${originating_tool}"
   name: ${release_plan_staged_name}
 spec:
+  releaseGracePeriodDays: 1
   application: ${application_name}
   target: ${managed_namespace}
 ---
@@ -61,6 +65,7 @@ metadata:
     originating-tool: "${originating_tool}"
   name: ${release_plan_optin_name}
 spec:
+  releaseGracePeriodDays: 1
   application: optin-${application_name}
   target: ${managed_namespace}
 ---
@@ -74,5 +79,20 @@ metadata:
     originating-tool: "${originating_tool}"
   name: ${release_plan_multi_optin_name}
 spec:
+  releaseGracePeriodDays: 1
   application: multi-optin-${application_name}
+  target: ${managed_namespace}
+---
+apiVersion: appstudio.redhat.com/v1alpha1
+kind: ReleasePlan
+metadata:
+  labels:
+    release.appstudio.openshift.io/auto-release: ${release_plan_multi_happy_auto_release}
+    release.appstudio.openshift.io/standing-attribution: 'true'
+    release.appstudio.openshift.io/releasePlanAdmission: "${release_plan_admission_multi_happy_name}"
+    originating-tool: "${originating_tool}"
+  name: ${release_plan_multi_happy_name}
+spec:
+  releaseGracePeriodDays: 1
+  application: ${multi_happy_application_name}
   target: ${managed_namespace}

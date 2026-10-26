@@ -145,9 +145,31 @@ get_build_pipeline_run_url() { # args are ns, app, name
   fi
 }
 
+# Delete Releases after removing the test's ReleasePlan to stop new automated releases.
+cleanup_test_releases() {
+    if [ -z "${uuid:-}" ] || [ -z "${tenant_namespace:-}" ] || [ -z "${originating_tool:-}" ]; then
+        echo "Skipping Release CR cleanup: test identity or namespace not set"
+        return 0
+    fi
+
+    # Automated Releases may exist before the harness gets to patch their cleanup labels.
+    # Each suite's ReleasePlan name includes its run UUID, so parallel runs stay isolated.
+    if [ -n "${release_plan_name:-}" ]; then
+        kubectl delete release -n "${tenant_namespace}" \
+            -l "release.appstudio.openshift.io/releasePlan=${release_plan_name}" \
+            --ignore-not-found || echo "Warning: Failed to delete Releases for ${release_plan_name}"
+    fi
+
+    kubectl delete release -n "${tenant_namespace}" \
+        -l "test-run-uuid=${uuid},originating-tool=${originating_tool}" \
+        --ignore-not-found || echo "Warning: Failed to delete labeled test Releases"
+}
+
 # Function for cleaning up resources
 # Relies on global variables: CLEANUP, SUITE_DIR, component_repo_name, component_branch, tmpDir, advisory_yaml_dir
 # Optional variables: component2_repo_name (for multi-component tests), uuid (from test.env), tenant_namespace
+# Optional suite hook: suite_exit_cleanup() in <suite>/test.sh (runs before resource cleanup; always invoked).
+# Suites that patch decrypt_secrets output in place should delete those files here so the next run decrypts fresh.
 cleanup_resources() {
   local err=${1:-0} # Default to 0 if no error code passed
   local line=${2:-"N/A"}
@@ -160,6 +182,12 @@ cleanup_resources() {
     echo "$0: ERROR: Command '$command' failed at line $line - exited with status $err"
   fi
 
+  if type suite_exit_cleanup &>/dev/null; then
+    if ! ( set +eo pipefail; suite_exit_cleanup ); then
+      echo "Warning: suite_exit_cleanup failed (temporary credential files may remain on disk; continuing with resource cleanup)" >&2
+    fi
+  fi
+
   if [ "${CLEANUP}" == "true" ]; then
     echo "Performing cleanup..."
     # cleanup...so we can ignore errors
@@ -169,33 +197,21 @@ cleanup_resources() {
     echo "Cleanup log file: ${cleanup_log_file}"
     echo -e "\n--- Cleanup Log ---" > "${cleanup_log_file}"
 
-    # Clean up component repository
-    echo "Deleting Github repository ${component_repo_name} ..." >> "${cleanup_log_file}"
-    "${SUITE_DIR}/../scripts/delete-repository.sh" "${component_repo_name}"
-
-    # Clean up component2 repository if it exists and is different from component repo
-    if [ -n "${component2_repo_name}" ] && [ "${component2_repo_name}" != "${component_repo_name}" ]; then
-      echo "Deleting Github repository ${component2_repo_name} ..." >> "${cleanup_log_file}"
-      "${SUITE_DIR}/../scripts/delete-repository.sh" "${component2_repo_name}"
-    fi
-
-    # Clean up optin repository if it exists and is different from component repo
-    if [ -n "${optin_component_repo_name}" ] && [ "${optin_component_repo_name}" != "${component_repo_name}" ]; then
-      echo "Deleting Github repository ${optin_component_repo_name} ..." >> "${cleanup_log_file}"
-      "${SUITE_DIR}/../scripts/delete-repository.sh" "${optin_component_repo_name}"
-    fi
-
-    # Clean up optin component 1 repository
-    if [ -n "${optin_component_1_repo_name}" ]; then
-      echo "Deleting Github repository ${optin_component_1_repo_name} ..." >> "${cleanup_log_file}"
-      "${SUITE_DIR}/../scripts/delete-repository.sh" "${optin_component_1_repo_name}"
-    fi
-
-    # Clean up optin component 2 repository if it exists and is different from component repo
-    if [ -n "${optin_component_2_repo_name}" ] && [ "${optin_component_2_repo_name}" != "${component_repo_name}" ]; then
-      echo "Deleting Github repository ${optin_component_2_repo_name} ..." >> "${cleanup_log_file}"
-      "${SUITE_DIR}/../scripts/delete-repository.sh" "${optin_component_2_repo_name}"
-    fi
+    # Clean up the component GitHub repositories. Iterate PTSV_COMPONENTS so any
+    # component a suite adds is covered automatically (matches how they are
+    # created). Deduplicate, since some components share one repo (e.g.
+    # component2 reuses the component repo, multi_happy_component_2 reuses
+    # multi_happy_component_1's) so each repo is deleted only once.
+    local _deleted_repos=" "
+    for component in ${PTSV_COMPONENTS}; do
+      local _rv="${component}_repo_name"
+      local _repo="${!_rv}"
+      if [ -n "${_repo}" ] && [[ "${_deleted_repos}" != *" ${_repo} "* ]]; then
+        echo "Deleting Github repository ${_repo} ..." >> "${cleanup_log_file}"
+        "${SUITE_DIR}/../scripts/delete-repository.sh" "${_repo}"
+        _deleted_repos="${_deleted_repos}${_repo} "
+      fi
+    done
 
     if [ -n "$tmpDir" ] && [ -d "$tmpDir" ]; then
         echo "Deleting test resources..." | tee -a "${cleanup_log_file}"
@@ -212,18 +228,7 @@ cleanup_resources() {
         echo "tmpDir not set or not a directory, skipping k8s resource cleanup." | tee -a "${cleanup_log_file}"
     fi
 
-    # Clean up Release CRs created by this specific test suite
-    # Use both uuid and originating-tool labels to avoid deleting Release CRs
-    # belonging to other parallel test suites that share the same uuid
-    if [ -n "$uuid" ] && [ -n "$tenant_namespace" ] && [ -n "$originating_tool" ]; then
-        echo "Deleting Release CRs with test-run-uuid=${uuid},originating-tool=${originating_tool} in namespace ${tenant_namespace}..." | tee -a "${cleanup_log_file}"
-        kubectl delete release -n "${tenant_namespace}" \
-            -l "test-run-uuid=${uuid},originating-tool=${originating_tool}" \
-            --ignore-not-found >> "${cleanup_log_file}" 2>&1 || \
-            echo "Warning: Failed to delete some Release CRs" | tee -a "${cleanup_log_file}"
-    else
-        echo "Skipping Release CR cleanup: uuid or tenant_namespace not set" | tee -a "${cleanup_log_file}"
-    fi
+    cleanup_test_releases >> "${cleanup_log_file}" 2>&1
 
     # Clean up ImageRepository objects created by the image controller for test components.
     # These may have no ownerReferences, so they may not be cascade-deleted with the Component.
@@ -401,6 +406,13 @@ create_kubernetes_resources() {
     echo "Resolving symlinks in resources directories..."
     resolve_symlinks_for_kustomize "${SUITE_DIR}/resources/tenant" "$tmpDir/tenant"
     resolve_symlinks_for_kustomize "${SUITE_DIR}/resources/managed" "$tmpDir/managed"
+
+    # Optional suite hook: adjust the copied tenant kustomization before building
+    # (e.g. drop Component files for scenarios not enabled this run). Operates on
+    # the tmpDir copy, so the source resources are untouched. No-op if undefined.
+    if type filter_tenant_kustomization &>/dev/null; then
+        filter_tenant_kustomization "$tmpDir/tenant"
+    fi
 
     # Apply infrastructure secrets first (if they exist) - these persist across test runs
     local managed_infra_secrets_file="$tmpDir/managed/secrets/managed-infra-secrets.yaml"
@@ -990,6 +1002,11 @@ cleanup_old_resources() {
                 close(cmd)
                 if (created_at < cutoff_time) {
                     print "kubectl delete " kind "/" $2 " -n " $1
+                    # Releases can lack cleanup labels if their test exited before discovery.
+                    if (kind == "rp") {
+                        print "kubectl delete release -n " $1 \
+                            " -l release.appstudio.openshift.io/releasePlan=" $2 " --ignore-not-found"
+                    }
                 }
             }
             ' | tee -a "${old_resources_file}"
@@ -1038,13 +1055,30 @@ is_task_skipped() {
     local task_name=$2
 
     local pipelinerun_name
-    pipelinerun_name=$(get_pipelinerun_name_from_release "${release_name}") || return 1
+    pipelinerun_name="$(get_pipelinerun_name_from_release "${release_name}")" || return 1
 
     local skipped_task
-    skipped_task=$(kubectl get pipelinerun "${pipelinerun_name}" -n "${managed_namespace}" \
-        -o jsonpath="{.status.skippedTasks[?(@.name=='${task_name}')].name}")
+    skipped_task="$(kubectl get pipelinerun "${pipelinerun_name}" -n "${managed_namespace}" \
+        -o jsonpath="{.status.skippedTasks[?(@.name=='${task_name}')].name}")"
 
     [[ -n "${skipped_task}" ]]
+}
+
+# Return 0 (true) if the named task appears in the PipelineRun's childReferences
+# (i.e., it actually executed), 1 (false) otherwise.
+did_task_run() {
+    local release_name="${1}"
+    local task_name="${2}"
+
+    local pipelinerun_name
+    pipelinerun_name="$(get_pipelinerun_name_from_release "${release_name}")" || return 1
+
+    local task_ref
+    task_ref="$(kubectl get pipelinerun "${pipelinerun_name}" -n "${managed_namespace}" -o json \
+        | jq -r --arg task_name "${task_name}" \
+            '.status.childReferences[]? | select(.pipelineTaskName == $task_name) | .name // empty')"
+
+    [[ -n "${task_ref}" ]]
 }
 
 # Return the value of a named pipeline-level result from the managed PipelineRun
@@ -1058,6 +1092,174 @@ get_pipelinerun_result() {
 
     kubectl get pipelinerun "${pipelinerun_name}" -n "${managed_namespace}" \
         -o jsonpath="{.status.results[?(@.name=='${result_name}')].value}"
+}
+
+# --- SBOM Verification Helpers ---
+# These helpers validate Atlas SBOM URLs in Release status.artifacts.sboms
+
+# Verify a single Atlas/Trustify SBOM URL has the required path and a valid UUID.
+# The hostname is not fixed: the release may upload to staging Atlas or a
+# cluster-configured Trustify endpoint.
+# Arguments: $1=url
+# Returns: 0 if valid, 1 otherwise
+verify_atlas_url() {
+    local url="${1}"
+    # Ignore query/fragment so /sboms/urn:uuid:<UUID> is only accepted in the path
+    local url_path="${url%%#*}"
+    url_path="${url_path%%\?*}"
+    local host_re='^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$'
+    local ipv4_re='^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$'
+    local uuid_re='[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
+    local path_re="^(/[^[:space:]/?#]+)*/sboms/urn:uuid:${uuid_re}$"
+    local invalid_url="🔴 Atlas URL '${url}' is not an https URL with a valid host and path /sboms/urn:uuid:<UUID>"
+
+    if [[ ! "${url_path}" =~ ^https://([^/?#]+)(/.*)$ ]]; then
+        echo "${invalid_url}"
+        return 1
+    fi
+
+    local authority="${BASH_REMATCH[1]}"
+    local path="${BASH_REMATCH[2]}"
+    local host="${authority}"
+    local port=""
+
+    # Atlas and Trustify links are https://host[:port]/... with no userinfo
+    if [[ "${authority}" == *@* || -z "${authority}" ]]; then
+        echo "${invalid_url}"
+        return 1
+    fi
+
+    if [[ "${authority}" == *:* ]]; then
+        host="${authority%%:*}"
+        port="${authority#*:}"
+        # A second colon is not a numeric port (for example host:80:443)
+        if [[ -z "${host}" || -z "${port}" || "${port}" == *:* ]]; then
+            echo "${invalid_url}"
+            return 1
+        fi
+        if [[ ! "${port}" =~ ^[0-9]+$ ]] || (( ${#port} > 5 )) || (( 10#${port} < 1 || 10#${port} > 65535 )); then
+            echo "🔴 Atlas URL '${url}' has a nonnumeric or out-of-range port"
+            return 1
+        fi
+    fi
+
+    if [[ "${host}" =~ ${ipv4_re} ]]; then
+        local octet
+        for octet in "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}" "${BASH_REMATCH[4]}"; do
+            if (( 10#${octet} > 255 )); then
+                echo "${invalid_url}"
+                return 1
+            fi
+        done
+    elif [[ ! "${host}" =~ ${host_re} ]]; then
+        echo "${invalid_url}"
+        return 1
+    fi
+
+    if [[ ! "${path}" =~ ${path_re} ]]; then
+        echo "${invalid_url}"
+        return 1
+    fi
+
+    return 0
+}
+
+# Verify SBOM structure in Release status.artifacts.sboms
+# Arguments:
+#   $1: sboms_json - the JSON object from .status.artifacts.sboms
+#   $2: expected_product_count - expected number of product SBOMs (default: 1)
+#   $3: expected_component_count - expected number of component SBOMs (default: 1)
+# Increments global $failures variable on errors
+# Sets RUN_TEST_FAILURE_MESSAGE when unset so e2e results capture the SBOM failure
+verify_sboms() {
+    local sboms_json="${1}"
+    local expected_product_count="${2:-1}"
+    local expected_component_count="${3:-1}"
+    local any_failures=0
+    local sbom_failure_messages=()
+    local failure_message=""
+
+    # Verify product SBOMs - require array with valid string URLs
+    if ! jq -e '.product | type == "array"' <<< "${sboms_json}" >/dev/null 2>&1; then
+        failure_message="sboms.product is not an array or is missing"
+        echo "🔴 ${failure_message}"
+        sbom_failure_messages+=("${failure_message}")
+        any_failures=1
+    else
+        local product_count
+        product_count="$(jq -r '.product | length' <<< "${sboms_json}")"
+
+        if [ "${product_count}" -eq "${expected_product_count}" ]; then
+            echo "✅️ Found expected number of product SBOMs: ${product_count}"
+            local idx
+            for ((idx=0; idx<product_count; idx++)); do
+                local atlas_url
+                atlas_url="$(jq -r --argjson i "${idx}" '.product[$i] // empty' <<< "${sboms_json}")"
+                if [ -z "${atlas_url}" ] || [ "${atlas_url}" = "null" ]; then
+                    failure_message="Product SBOM entry ${idx} is null or empty"
+                    echo "🔴 ${failure_message}"
+                    sbom_failure_messages+=("${failure_message}")
+                    any_failures=1
+                elif verify_atlas_url "${atlas_url}"; then
+                    echo "✅️ Valid product SBOM Atlas URL: ${atlas_url}"
+                else
+                    failure_message="Invalid product SBOM Atlas URL: ${atlas_url}"
+                    sbom_failure_messages+=("${failure_message}")
+                    any_failures=1
+                fi
+            done
+        else
+            failure_message="Incorrect number of product SBOMs. Expected ${expected_product_count}, found: ${product_count}"
+            echo "🔴 ${failure_message}"
+            sbom_failure_messages+=("${failure_message}")
+            any_failures=1
+        fi
+    fi
+
+    # Verify component SBOMs - require array with valid string URLs
+    if ! jq -e '.component | type == "array"' <<< "${sboms_json}" >/dev/null 2>&1; then
+        failure_message="sboms.component is not an array or is missing"
+        echo "🔴 ${failure_message}"
+        sbom_failure_messages+=("${failure_message}")
+        any_failures=1
+    else
+        local component_count
+        component_count="$(jq -r '.component | length' <<< "${sboms_json}")"
+
+        if [ "${component_count}" -eq "${expected_component_count}" ]; then
+            echo "✅️ Found expected number of component SBOMs: ${component_count}"
+            local idx
+            for ((idx=0; idx<component_count; idx++)); do
+                local atlas_url
+                atlas_url="$(jq -r --argjson i "${idx}" '.component[$i] // empty' <<< "${sboms_json}")"
+                if [ -z "${atlas_url}" ] || [ "${atlas_url}" = "null" ]; then
+                    failure_message="Component SBOM entry ${idx} is null or empty"
+                    echo "🔴 ${failure_message}"
+                    sbom_failure_messages+=("${failure_message}")
+                    any_failures=1
+                elif verify_atlas_url "${atlas_url}"; then
+                    echo "✅️ Valid component SBOM Atlas URL: ${atlas_url}"
+                else
+                    failure_message="Invalid component SBOM Atlas URL: ${atlas_url}"
+                    sbom_failure_messages+=("${failure_message}")
+                    any_failures=1
+                fi
+            done
+        else
+            failure_message="Incorrect number of component SBOMs. Expected ${expected_component_count}, found: ${component_count}"
+            echo "🔴 ${failure_message}"
+            sbom_failure_messages+=("${failure_message}")
+            any_failures=1
+        fi
+    fi
+
+    if [ "${any_failures}" -eq 1 ]; then
+        if [ -z "${RUN_TEST_FAILURE_MESSAGE:-}" ] && [ "${#sbom_failure_messages[@]}" -gt 0 ]; then
+            RUN_TEST_FAILURE_MESSAGE=$(printf '%s; ' "${sbom_failure_messages[@]}")
+            RUN_TEST_FAILURE_MESSAGE=${RUN_TEST_FAILURE_MESSAGE%; }
+        fi
+        failures=$((failures+1))
+    fi
 }
 
 # Function to verify Release contents
@@ -1271,6 +1473,7 @@ metadata:
   labels:
     release.appstudio.openshift.io/automated: "false"
     release.appstudio.openshift.io/author: "${author}"
+    originating-tool: "${originating_tool}"
     test-run-uuid: "${uuid}"
 spec:
   releasePlan: ${release_plan_name}
@@ -1459,6 +1662,49 @@ wait_for_multi_component_snapshot() {
     echo "$snapshot_name"
 }
 
+# Validate URL, shasum, and arches on each image entry in release status JSON.
+# Arguments: $1=release JSON, $2=optional context label for messages
+# Returns 0 when all image entries are valid (or there are no images), 1 otherwise.
+# Uses PTSV_EXPECTED_ARCHES (defaults to amd64).
+validate_release_image_artifact_fields() {
+    local release_json="${1}"
+    local context_label="${2:-Release}"
+    local image_count failure_count=0 i
+    local expected_arches="${PTSV_EXPECTED_ARCHES:-amd64}"
+
+    image_count="$(jq -r '(.status.artifacts.images // []) | length' <<< "${release_json}")"
+    if [ "${image_count}" -eq 0 ]; then
+        return 0
+    fi
+
+    echo "Validating ${image_count} image artifact(s) for ${context_label}..."
+    for ((i = 0; i < image_count; i++)); do
+        local image_url image_shasum str_image_arches
+        image_url="$(jq -r --argjson idx "${i}" '.status.artifacts.images[$idx]?.urls[0] // ""' <<< "${release_json}")"
+        image_shasum="$(jq -r --argjson idx "${i}" '.status.artifacts.images[$idx]?.shasum // ""' <<< "${release_json}")"
+        str_image_arches="$(jq -r --argjson idx "${i}" \
+            '[.status.artifacts.images[$idx].arches[]?] | sort | unique | join(" ")' <<< "${release_json}")"
+
+        if [ -z "${image_url}" ]; then
+            echo "🔴 ${context_label} image[${i}]: image_url was empty"
+            failure_count=$((failure_count + 1))
+        fi
+        if [ -z "${image_shasum}" ]; then
+            echo "🔴 ${context_label} image[${i}]: image_shasum was empty"
+            failure_count=$((failure_count + 1))
+        fi
+        if [ "${str_image_arches}" != "${expected_arches}" ]; then
+            echo "🔴 ${context_label} image[${i}]: expected arches '${expected_arches}', found '${str_image_arches}'"
+            failure_count=$((failure_count + 1))
+        fi
+    done
+
+    if [ "${failure_count}" -eq 0 ]; then
+        echo "✅ ${context_label}: all image artifacts have valid URL, shasum, and arches"
+    fi
+    return $((failure_count > 0 ? 1 : 0))
+}
+
 check_container_images() {
     local expected_count image_count
 
@@ -1473,7 +1719,11 @@ check_container_images() {
         failures=$((failures+1))
     fi
 
-    echo "Verifying each image artifact..."
+    if ! validate_release_image_artifact_fields "${release_json}" "Release"; then
+        failures=$((failures + 1))
+    fi
+
+    echo "Verifying each image artifact (pullability and signatures)..."
 
     local rpa_json
     rpa_json=$(kubectl get releaseplanadmission "${release_plan_admission_name}" \
@@ -1502,34 +1752,13 @@ check_container_images() {
 
     for ((i = 0; i < image_count; i++)); do
         local failures=0
-        local image_url image_arch image_shasum
-        image_url=$(jq -r --argjson idx "${i}" '.status.artifacts.images[$idx]?.urls[0] // ""' <<< "${release_json}")
-        image_arches=$(jq -r --argjson idx "${i}" '.status.artifacts.images[$idx]?.arches // ""' <<< "${release_json}")
-        image_shasum=$(jq -r --argjson idx "${i}" '.status.artifacts.images[$idx]?.shasum // ""' <<< "${release_json}")
+        local image_url image_shasum
+        image_url="$(jq -r --argjson idx "${i}" '.status.artifacts.images[$idx]?.urls[0] // ""' <<< "${release_json}")"
+        image_shasum="$(jq -r --argjson idx "${i}" '.status.artifacts.images[$idx]?.shasum // ""' <<< "${release_json}")"
 
-        echo "Checking Image URL..."
-        if [ -n "${image_url}" ]; then
-            echo "✅️ image_url: ${image_url}"
-        else
-            echo "🔴 image_url was empty"
-            failures=$((failures+1))
-        fi
-
-        str_image_arches=$(echo "${image_arches}" |  jq -r '. | sort | unique | join(" ")')
-        echo "Checking image arches..."
-        if [ "${str_image_arches}" = "$PTSV_EXPECTED_ARCHES" ]; then
-            echo "✅️ Found required image arches: $PTSV_EXPECTED_ARCHES"
-        else
-            echo "🔴 Expected image arches: '$PTSV_EXPECTED_ARCHES', found: '${image_arches}'"
-            failures=$((failures+1))
-        fi
-
-        echo "Checking Image Shasum..."
-        if [ -n "${image_shasum}" ]; then
-            echo "✅️ image_shasum: ${image_shasum}"
-        else
-            echo "🔴 image_shasum was empty"
-            failures=$((failures+1))
+        if [ -z "${image_url}" ] || [ -z "${image_shasum}" ]; then
+            echo "Skipping skopeo/cosign checks for image[${i}] (missing URL or shasum)"
+            continue
         fi
 
         # Use digest instead of tag, tag can be overwritten by concurrent tests

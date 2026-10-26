@@ -24,15 +24,15 @@ spec:
       description: Name of the user that requested the signing, for auditing purposes
     - name: requestTimeout
       type: string
-      default: "1800"
-      description: InternalRequest timeout
+      default: "4500"
+      description: InternalRequest timeout in seconds
     - name: pipelineTimeout
       type: string
-      default: "0h30m0s"
+      default: "1h10m0s"
       description: Pipeline timeout for the signing InternalRequest
     - name: taskTimeout
       type: string
-      default: "0h25m0s"
+      default: "1h0m0s"
       description: Task timeout for the signing InternalRequest
     - name: pipelineRunUid
       type: string
@@ -94,7 +94,7 @@ spec:
       type: string
       description: >-
         Git revision (branch, tag, or commit) in the signing repository
-      default: "ab3ddda2e9c9104699d9bd320b7b18c62deb2df4"
+      default: "042cffdd27794f57ee95f30b6631b0f9f365fca1"
     - name: caTrustConfigMapName
       type: string
       description: The name of the ConfigMap to read CA bundle data from
