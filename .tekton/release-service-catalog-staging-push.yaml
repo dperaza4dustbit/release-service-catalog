@@ -61,7 +61,9 @@ spec:
       taskSpec:
         params:
         - name: secretName
+          type: string
         - name: secretKeyName
+          type: string
         volumes:
         - name: slack-token
           secret:
@@ -161,6 +163,7 @@ spec:
     - default: ""
       description: Image tag expiration time, time values could be something like 1h, 2d, 3w for hours, days, and weeks, respectively.
       name: image-expires-after
+      type: string
     - default: "false"
       description: Build a source image.
       name: build-source-image
