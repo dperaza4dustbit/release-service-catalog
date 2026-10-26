@@ -10,6 +10,7 @@ Upload Python packages (with attestations) to a Pulp repository.
 | PULP_BASE_URL               | The base URL of the Pulp server                                                                       | No       | -                            |
 | PULP_API_ROOT               | The API root path of the Pulp server                                                                  | Yes      | /api/                        |
 | PULP_DOMAIN                 | The domain to use for Pulp operations                                                                 | No       | -                            |
+| PULP_DISTRIBUTION_BASE_PATH | Optional Pulp distribution base path for the upload endpoint                                          | Yes      | ""                           |
 | PULP_REPOSITORY             | The Pulp repository to upload to                                                                      | No       | -                            |
 | sourceDataArtifact          | Trusted Artifact containing the signed wheels and attestations                                        | No       | -                            |
 | dataDir                     | The location where data will be stored                                                                | Yes      | /var/workdir                 |
